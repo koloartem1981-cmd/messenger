@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: messenger-backend
+    runtime: docker
+    plan: free
+    rootDir: backend
+    dockerfilePath: ./Dockerfile
+    region: oregon
+    envVars:
+      - key: PORT
+        value: "10000"

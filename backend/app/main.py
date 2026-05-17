@@ -4,6 +4,7 @@ import asyncio
 import json
 import os
 import secrets
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Annotated, Optional
@@ -12,6 +13,7 @@ from fastapi import (
     Depends,
     FastAPI,
     File,
+    Form,
     HTTPException,
     Query,
     UploadFile,
@@ -46,6 +48,8 @@ from sqlalchemy.orm import (
     sessionmaker,
 )
 
+# ---------- Paths ----------
+
 DATA_DIR_ENV = os.environ.get("MESSENGER_DATA_DIR")
 if DATA_DIR_ENV:
     DATA_DIR = Path(DATA_DIR_ENV)
@@ -58,12 +62,44 @@ DATA_DIR.mkdir(parents=True, exist_ok=True)
 AVATAR_DIR = DATA_DIR / "avatars"
 AVATAR_DIR.mkdir(parents=True, exist_ok=True)
 
+MEDIA_DIR = DATA_DIR / "media"
+MEDIA_DIR.mkdir(parents=True, exist_ok=True)
+
 DB_PATH = DATA_DIR / "app.db"
 DATABASE_URL = f"sqlite:///{DB_PATH}"
 
-SECRET_KEY = os.environ.get("MESSENGER_SECRET_KEY") or secrets.token_urlsafe(64)
+# ---------- Auth secret ----------
+
+# Read from env, or fall back to a file inside DATA_DIR so tokens survive
+# container restarts even if the operator forgets to pin the env var.
+SECRET_KEY_FILE = DATA_DIR / "secret_key.txt"
+
+
+def _load_or_create_secret_key() -> str:
+    env = os.environ.get("MESSENGER_SECRET_KEY")
+    if env:
+        return env
+    if SECRET_KEY_FILE.exists():
+        text = SECRET_KEY_FILE.read_text(encoding="utf-8").strip()
+        if text:
+            return text
+    generated = secrets.token_urlsafe(64)
+    SECRET_KEY_FILE.write_text(generated, encoding="utf-8")
+    return generated
+
+
+SECRET_KEY = _load_or_create_secret_key()
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_DAYS = 30
+
+# ---------- Limits ----------
+
+MAX_AVATAR_BYTES = 5 * 1024 * 1024
+MAX_MEDIA_BYTES = 50 * 1024 * 1024
+
+MEDIA_KINDS = {"voice", "photo", "video", "file", "video_circle"}
+
+# ---------- DB ----------
 
 engine = create_engine(
     DATABASE_URL,
@@ -110,13 +146,21 @@ class Message(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     sender_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
     recipient_id: Mapped[int] = mapped_column(ForeignKey("users.id"), index=True)
-    content: Mapped[str] = mapped_column(Text, nullable=False)
+    kind: Mapped[str] = mapped_column(String(16), nullable=False, default="text")
+    content: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    media_uuid: Mapped[Optional[str]] = mapped_column(String(36), nullable=True)
+    media_mime: Mapped[Optional[str]] = mapped_column(String(80), nullable=True)
+    media_size: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    media_duration_ms: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    media_filename: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime, default=lambda: datetime.now(timezone.utc), index=True
     )
 
 
 Base.metadata.create_all(engine)
+
+# ---------- Session dep ----------
 
 
 def get_db():
@@ -125,6 +169,9 @@ def get_db():
         yield db
     finally:
         db.close()
+
+
+# ---------- Crypto / auth helpers ----------
 
 
 def hash_password(password: str) -> str:
@@ -172,6 +219,9 @@ def get_current_user(
     return user
 
 
+# ---------- Serializers ----------
+
+
 def user_to_public(u: User) -> dict:
     return {
         "id": u.id,
@@ -186,13 +236,24 @@ def message_to_dict(m: Message) -> dict:
     created = m.created_at
     if created.tzinfo is None:
         created = created.replace(tzinfo=timezone.utc)
-    return {
+    out: dict = {
         "id": m.id,
         "sender_id": m.sender_id,
         "recipient_id": m.recipient_id,
-        "content": m.content,
+        "kind": m.kind or "text",
+        "content": m.content or "",
         "created_at": created.isoformat(),
     }
+    if m.media_uuid:
+        out["media_url"] = f"/media/{m.media_uuid}"
+        out["media_mime"] = m.media_mime
+        out["media_size"] = m.media_size
+        out["media_duration_ms"] = m.media_duration_ms
+        out["media_filename"] = m.media_filename
+    return out
+
+
+# ---------- App ----------
 
 
 app = FastAPI(title="Messenger API")
@@ -251,6 +312,17 @@ class AddContactRequest(BaseModel):
 
 def _normalize_username(username: str) -> str:
     return username.strip().lower()
+
+
+def _ensure_mutual_contacts(db: Session, a: int, b: int) -> None:
+    for owner_id, other_id in ((a, b), (b, a)):
+        exists = db.scalar(
+            select(Contact).where(
+                and_(Contact.owner_id == owner_id, Contact.contact_id == other_id)
+            )
+        )
+        if not exists:
+            db.add(Contact(owner_id=owner_id, contact_id=other_id))
 
 
 # ---------- Auth ----------
@@ -319,7 +391,7 @@ async def upload_avatar(
     if file.content_type not in {"image/jpeg", "image/png", "image/webp"}:
         raise HTTPException(status_code=400, detail="Unsupported image format")
     raw = await file.read()
-    if len(raw) > 5 * 1024 * 1024:
+    if len(raw) > MAX_AVATAR_BYTES:
         raise HTTPException(status_code=413, detail="Image too large (max 5MB)")
     out_path = AVATAR_DIR / f"{current.id}.jpg"
     try:
@@ -519,24 +591,122 @@ async def send_message(
     msg = Message(
         sender_id=current.id,
         recipient_id=recipient.id,
+        kind="text",
         content=req.content.strip(),
     )
     db.add(msg)
     db.commit()
     db.refresh(msg)
     payload = message_to_dict(msg)
-    for owner_id, other_id in ((current.id, recipient.id), (recipient.id, current.id)):
-        exists = db.scalar(
-            select(Contact).where(
-                and_(Contact.owner_id == owner_id, Contact.contact_id == other_id)
-            )
-        )
-        if not exists:
-            db.add(Contact(owner_id=owner_id, contact_id=other_id))
+    _ensure_mutual_contacts(db, current.id, recipient.id)
     db.commit()
     await ws_manager.broadcast(recipient.id, {"type": "message", "data": payload})
     await ws_manager.broadcast(current.id, {"type": "message", "data": payload})
     return payload
+
+
+def _ext_for_mime(mime: Optional[str], fallback: str = "bin") -> str:
+    if not mime:
+        return fallback
+    mime_main = mime.split(";")[0].strip().lower()
+    return {
+        "image/jpeg": "jpg",
+        "image/jpg": "jpg",
+        "image/png": "png",
+        "image/webp": "webp",
+        "image/gif": "gif",
+        "video/mp4": "mp4",
+        "video/quicktime": "mov",
+        "video/webm": "webm",
+        "audio/mp4": "m4a",
+        "audio/aac": "aac",
+        "audio/mpeg": "mp3",
+        "audio/ogg": "ogg",
+        "audio/wav": "wav",
+        "audio/webm": "webm",
+    }.get(mime_main, fallback)
+
+
+@app.post("/messages/media")
+async def send_media_message(
+    current: Annotated[User, Depends(get_current_user)],
+    db: Annotated[Session, Depends(get_db)],
+    file: UploadFile = File(...),
+    recipient_id: int = Form(...),
+    kind: str = Form(...),
+    duration_ms: Optional[int] = Form(default=None),
+    caption: Optional[str] = Form(default=None),
+):
+    if kind not in MEDIA_KINDS:
+        raise HTTPException(status_code=400, detail=f"Unsupported kind: {kind}")
+    recipient = db.get(User, recipient_id)
+    if recipient is None:
+        raise HTTPException(status_code=404, detail="Recipient not found")
+    if recipient.id == current.id:
+        raise HTTPException(status_code=400, detail="Cannot send media to yourself")
+
+    raw = await file.read()
+    size = len(raw)
+    if size == 0:
+        raise HTTPException(status_code=400, detail="Empty file")
+    if size > MAX_MEDIA_BYTES:
+        raise HTTPException(status_code=413, detail="Media too large (max 50MB)")
+
+    mime = file.content_type or "application/octet-stream"
+    ext = _ext_for_mime(
+        mime,
+        fallback=(Path(file.filename or "").suffix.lstrip(".") or "bin").lower(),
+    )
+    media_uuid = uuid.uuid4().hex
+    out_path = MEDIA_DIR / f"{media_uuid}.{ext}"
+    out_path.write_bytes(raw)
+
+    original_name: Optional[str] = None
+    if kind == "file":
+        original_name = (file.filename or "").strip() or None
+
+    msg = Message(
+        sender_id=current.id,
+        recipient_id=recipient.id,
+        kind=kind,
+        content=(caption or "").strip(),
+        media_uuid=media_uuid,
+        media_mime=mime,
+        media_size=size,
+        media_duration_ms=duration_ms if duration_ms and duration_ms > 0 else None,
+        media_filename=original_name,
+    )
+    db.add(msg)
+    db.commit()
+    db.refresh(msg)
+    payload = message_to_dict(msg)
+    _ensure_mutual_contacts(db, current.id, recipient.id)
+    db.commit()
+    await ws_manager.broadcast(recipient.id, {"type": "message", "data": payload})
+    await ws_manager.broadcast(current.id, {"type": "message", "data": payload})
+    return payload
+
+
+@app.get("/media/{media_uuid}")
+async def get_media(media_uuid: str, db: Annotated[Session, Depends(get_db)]):
+    # The UUID itself is the capability — unguessable, ties the URL to a single
+    # message, similar to an S3 presigned URL. Plain audio/image tags can fetch
+    # without sending an Authorization header.
+    if len(media_uuid) != 32 or not all(c in "0123456789abcdef" for c in media_uuid):
+        raise HTTPException(status_code=404, detail="Not found")
+    msg = db.scalar(select(Message).where(Message.media_uuid == media_uuid))
+    if not msg:
+        raise HTTPException(status_code=404, detail="Not found")
+    matches = list(MEDIA_DIR.glob(f"{media_uuid}.*"))
+    if not matches:
+        raise HTTPException(status_code=404, detail="Not found")
+    p = matches[0]
+    media_type = msg.media_mime or "application/octet-stream"
+    headers: dict = {}
+    if msg.kind == "file" and msg.media_filename:
+        safe_name = msg.media_filename.replace('"', "")
+        headers["Content-Disposition"] = f'attachment; filename="{safe_name}"'
+    return FileResponse(p, media_type=media_type, headers=headers)
 
 
 # ---------- WebSocket ----------

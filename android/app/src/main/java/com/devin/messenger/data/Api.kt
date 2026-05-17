@@ -10,9 +10,11 @@ import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody
+import okhttp3.RequestBody.Companion.asRequestBody
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONArray
 import org.json.JSONObject
+import java.io.File
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
@@ -26,7 +28,8 @@ class Api(
 
     private val client = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
-        .readTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(60, TimeUnit.SECONDS)
         .pingInterval(20, TimeUnit.SECONDS)
         .build()
 
@@ -115,15 +118,27 @@ class Api(
 
     suspend fun uploadAvatar(token: String, uri: Uri): UserPublic = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
-        val mime = resolver.getType(uri) ?: "image/jpeg"
+        val rawMime = resolver.getType(uri) ?: "image/jpeg"
+        // Backend only accepts image/jpeg, image/png, image/webp — normalize anything
+        // exotic the gallery may report (heic/heif, etc.) to image/jpeg so the server
+        // re-encodes via Pillow rather than rejecting the upload.
+        val mime = when (rawMime.lowercase()) {
+            "image/jpeg", "image/jpg", "image/png", "image/webp" -> rawMime
+            else -> "image/jpeg"
+        }
         val bytes = resolver.openInputStream(uri).use { input ->
             requireNotNull(input) { "Cannot open image" }.readBytes()
+        }
+        val ext = when (mime) {
+            "image/png" -> "png"
+            "image/webp" -> "webp"
+            else -> "jpg"
         }
         val body = MultipartBody.Builder()
             .setType(MultipartBody.FORM)
             .addFormDataPart(
                 name = "file",
-                filename = "avatar.${if (mime.endsWith("png")) "png" else "jpg"}",
+                filename = "avatar.$ext",
                 body = bytes.toRequestBody(mime.toMediaType()),
             )
             .build()
@@ -193,8 +208,45 @@ class Api(
         return Message.fromJson(executeJson(req))
     }
 
+    suspend fun sendMediaMessage(
+        token: String,
+        recipientId: Long,
+        kind: String,
+        file: File,
+        mime: String,
+        durationMs: Int? = null,
+        caption: String? = null,
+    ): Message = withContext(Dispatchers.IO) {
+        val builder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                name = "file",
+                filename = file.name,
+                body = file.asRequestBody(mime.toMediaType()),
+            )
+            .addFormDataPart("recipient_id", recipientId.toString())
+            .addFormDataPart("kind", kind)
+        if (durationMs != null && durationMs > 0) {
+            builder.addFormDataPart("duration_ms", durationMs.toString())
+        }
+        if (!caption.isNullOrBlank()) {
+            builder.addFormDataPart("caption", caption)
+        }
+        val req = Request.Builder()
+            .url("$baseUrl/messages/media")
+            .post(builder.build())
+            .header("Authorization", "Bearer $token")
+            .build()
+        Message.fromJson(executeJson(req))
+    }
+
     fun avatarUrlFor(user: UserPublic): String? =
         user.avatarUrl?.let { path ->
+            if (path.startsWith("http")) path else "$baseUrl$path"
+        }
+
+    fun mediaUrlFor(message: Message): String? =
+        message.mediaUrl?.let { path ->
             if (path.startsWith("http")) path else "$baseUrl$path"
         }
 

@@ -39,6 +39,7 @@ object Routes {
         android.net.Uri.encode(value.ifEmpty { "_" })
 }
 
+@androidx.camera.core.ExperimentalGetImage
 @Composable
 fun AppNav(
     sessionStore: SessionStore,

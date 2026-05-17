@@ -1,25 +1,39 @@
 package com.devin.messenger.ui.chat
 
+import android.Manifest
+import android.content.Context
+import android.content.Intent
+import android.content.pm.PackageManager
+import android.media.MediaPlayer
+import android.net.Uri
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -28,7 +42,17 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.AttachFile
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.InsertDriveFile
+import androidx.compose.material.icons.rounded.Mic
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.PlayCircle
+import androidx.compose.material.icons.rounded.RadioButtonChecked
 import androidx.compose.material.icons.rounded.Send
+import androidx.compose.material.icons.rounded.Videocam
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -36,8 +60,11 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.OutlinedTextFieldDefaults
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -47,20 +74,40 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.ui.PlayerView
+import coil.compose.AsyncImage
+import coil.request.ImageRequest
+import coil.decode.VideoFrameDecoder
+import com.devin.messenger.audio.VoiceRecorder
 import com.devin.messenger.data.Api
 import com.devin.messenger.data.Message
+import com.devin.messenger.data.MessageKind
 import com.devin.messenger.data.RealtimeBus
 import com.devin.messenger.data.UserPublic
 import com.devin.messenger.ui.components.Avatar
 import com.devin.messenger.ui.theme.BrandPrimary
 import com.devin.messenger.ui.theme.IncomingBubbleDark
 import com.devin.messenger.ui.theme.OutgoingBubble
+import com.devin.messenger.ui.videocircle.VideoCircleRecorderScreen
+import com.devin.messenger.util.MediaUtils
+import java.io.File
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
+private const val MIN_VOICE_DURATION_MS = 700
+
+@androidx.camera.core.ExperimentalGetImage
 @Composable
 fun ChatScreen(
     api: Api,
@@ -72,9 +119,13 @@ fun ChatScreen(
     peerAvatarUrl: String?,
     onBack: () -> Unit,
 ) {
+    val context = LocalContext.current
     var messages by remember { mutableStateOf<List<Message>>(emptyList()) }
     var inputText by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
+    var attachMenuOpen by remember { mutableStateOf(false) }
+    var showCircleRecorder by remember { mutableStateOf(false) }
+    var pendingPermissionAction by remember { mutableStateOf<(() -> Unit)?>(null) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
@@ -86,6 +137,116 @@ fun ChatScreen(
             bio = null,
             avatarUrl = null,
         )
+    }
+
+    val recorder = remember(context) { VoiceRecorder(context) }
+    var isRecording by remember { mutableStateOf(false) }
+    var recordingStartedAt by remember { mutableStateOf(0L) }
+    var recordingElapsed by remember { mutableStateOf(0L) }
+
+    LaunchedEffect(isRecording) {
+        if (!isRecording) return@LaunchedEffect
+        while (isRecording) {
+            recordingElapsed = System.currentTimeMillis() - recordingStartedAt
+            delay(80)
+        }
+    }
+
+    suspend fun appendIfNew(msg: Message) {
+        if (messages.none { it.id == msg.id }) {
+            messages = messages + msg
+            listState.animateScrollToItem(messages.size - 1)
+        }
+    }
+
+    fun uploadCachedFile(
+        file: File,
+        kind: String,
+        mime: String,
+        durationMs: Int? = null,
+        caption: String? = null,
+        deleteAfter: Boolean = true,
+    ) {
+        val authToken = token ?: return
+        scope.launch {
+            try {
+                val sent = api.sendMediaMessage(
+                    token = authToken,
+                    recipientId = peerId,
+                    kind = kind,
+                    file = file,
+                    mime = mime,
+                    durationMs = durationMs,
+                    caption = caption,
+                )
+                appendIfNew(sent)
+            } catch (_: Exception) {
+                // surfaces silently for now; toast could be added later
+            } finally {
+                if (deleteAfter) runCatching { file.delete() }
+            }
+        }
+    }
+
+    val photoPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val copied = MediaUtils.copyUriToCache(context, uri, "photo") ?: return@rememberLauncherForActivityResult
+        uploadCachedFile(copied.file, MessageKind.PHOTO, copied.mime.ifBlank { "image/jpeg" })
+    }
+    val videoPicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val copied = MediaUtils.copyUriToCache(context, uri, "video") ?: return@rememberLauncherForActivityResult
+        val duration = MediaUtils.durationMsFor(copied.file)
+        uploadCachedFile(copied.file, MessageKind.VIDEO, copied.mime.ifBlank { "video/mp4" }, duration)
+    }
+    val filePicker = rememberLauncherForActivityResult(
+        ActivityResultContracts.GetContent(),
+    ) { uri ->
+        if (uri == null) return@rememberLauncherForActivityResult
+        val copied = MediaUtils.copyUriToCache(context, uri, "file") ?: return@rememberLauncherForActivityResult
+        uploadCachedFile(copied.file, MessageKind.FILE, copied.mime.ifBlank { "application/octet-stream" })
+    }
+
+    val cameraPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions(),
+    ) { result ->
+        val granted = result.values.all { it }
+        if (granted) pendingPermissionAction?.invoke()
+        pendingPermissionAction = null
+    }
+    val audioPermLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission(),
+    ) { granted ->
+        if (granted) pendingPermissionAction?.invoke()
+        pendingPermissionAction = null
+    }
+
+    fun ensureAudioPermission(then: () -> Unit) {
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) ==
+            PackageManager.PERMISSION_GRANTED
+        ) {
+            then()
+        } else {
+            pendingPermissionAction = then
+            audioPermLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
+
+    fun ensureCameraPermission(then: () -> Unit) {
+        val cam = ContextCompat.checkSelfPermission(context, Manifest.permission.CAMERA)
+        val aud = ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO)
+        if (cam == PackageManager.PERMISSION_GRANTED && aud == PackageManager.PERMISSION_GRANTED) {
+            then()
+        } else {
+            pendingPermissionAction = then
+            cameraPermLauncher.launch(
+                arrayOf(Manifest.permission.CAMERA, Manifest.permission.RECORD_AUDIO),
+            )
+        }
     }
 
     LaunchedEffect(token, peerId) {
@@ -145,34 +306,105 @@ fun ChatScreen(
                     MessageBubble(
                         message = msg,
                         isOutgoing = msg.senderId == currentUserId,
+                        api = api,
                     )
                 }
             }
 
-            MessageInput(
-                value = inputText,
-                onValueChange = { inputText = it },
-                sending = sending,
-                onSend = {
-                    val text = inputText.trim()
-                    if (text.isEmpty() || token == null || sending) return@MessageInput
-                    sending = true
-                    scope.launch {
-                        try {
-                            val sent = api.sendMessage(token, peerId, text)
-                            if (messages.none { it.id == sent.id }) {
-                                messages = messages + sent
-                                listState.animateScrollToItem(messages.size - 1)
+            if (isRecording) {
+                RecordingIndicator(
+                    elapsedMs = recordingElapsed,
+                    onCancel = {
+                        recorder.cancel()
+                        isRecording = false
+                        recordingElapsed = 0L
+                    },
+                    onStop = {
+                        val authToken = token
+                        val result = recorder.stop()
+                        isRecording = false
+                        if (authToken != null && result != null) {
+                            val (file, durationMs) = result
+                            if (durationMs >= MIN_VOICE_DURATION_MS && file.length() > 0) {
+                                uploadCachedFile(file, MessageKind.VOICE, "audio/mp4", durationMs)
+                            } else {
+                                runCatching { file.delete() }
                             }
-                            inputText = ""
-                        } catch (_: Exception) {
-                        } finally {
-                            sending = false
                         }
-                    }
-                },
-            )
+                        recordingElapsed = 0L
+                    },
+                )
+            } else {
+                MessageInput(
+                    value = inputText,
+                    onValueChange = { inputText = it },
+                    sending = sending,
+                    onSend = {
+                        val text = inputText.trim()
+                        if (text.isEmpty() || token == null || sending) return@MessageInput
+                        sending = true
+                        scope.launch {
+                            try {
+                                val sent = api.sendMessage(token, peerId, text)
+                                appendIfNew(sent)
+                                inputText = ""
+                            } catch (_: Exception) {
+                            } finally {
+                                sending = false
+                            }
+                        }
+                    },
+                    onAttach = { attachMenuOpen = true },
+                    onVoicePressAndHold = {
+                        ensureAudioPermission {
+                            runCatching {
+                                recorder.start()
+                                recordingStartedAt = System.currentTimeMillis()
+                                recordingElapsed = 0L
+                                isRecording = true
+                            }
+                        }
+                    },
+                )
+            }
         }
+    }
+
+    if (attachMenuOpen) {
+        AttachMenuDialog(
+            onDismiss = { attachMenuOpen = false },
+            onPickPhoto = {
+                attachMenuOpen = false
+                photoPicker.launch("image/*")
+            },
+            onPickVideo = {
+                attachMenuOpen = false
+                videoPicker.launch("video/*")
+            },
+            onPickFile = {
+                attachMenuOpen = false
+                filePicker.launch("*/*")
+            },
+            onVideoCircle = {
+                attachMenuOpen = false
+                ensureCameraPermission { showCircleRecorder = true }
+            },
+        )
+    }
+
+    if (showCircleRecorder) {
+        VideoCircleRecorderScreen(
+            onCancel = { showCircleRecorder = false },
+            onRecorded = { file, durationMs ->
+                showCircleRecorder = false
+                uploadCachedFile(
+                    file = file,
+                    kind = MessageKind.VIDEO_CIRCLE,
+                    mime = "video/mp4",
+                    durationMs = durationMs,
+                )
+            },
+        )
     }
 }
 
@@ -212,7 +444,7 @@ private fun ChatHeader(
 }
 
 @Composable
-private fun MessageBubble(message: Message, isOutgoing: Boolean) {
+private fun MessageBubble(message: Message, isOutgoing: Boolean, api: Api) {
     val arrangement = if (isOutgoing) Arrangement.End else Arrangement.Start
     val bubbleColor = if (isOutgoing) OutgoingBubble else IncomingBubbleDark
     val textColor = Color.White
@@ -227,18 +459,305 @@ private fun MessageBubble(message: Message, isOutgoing: Boolean) {
         exit = fadeOut(tween(160)),
     ) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = arrangement) {
-            Surface(
-                color = bubbleColor,
-                shape = shape,
+            when (message.kind) {
+                MessageKind.PHOTO -> PhotoMessage(message = message, api = api)
+                MessageKind.VIDEO -> VideoThumbMessage(message = message, api = api, bubbleColor = bubbleColor)
+                MessageKind.VIDEO_CIRCLE -> VideoCircleMessage(message = message, api = api)
+                MessageKind.VOICE -> Surface(color = bubbleColor, shape = shape) {
+                    VoiceMessageContent(message = message, api = api, textColor = textColor)
+                }
+                MessageKind.FILE -> Surface(color = bubbleColor, shape = shape) {
+                    FileMessageContent(message = message, api = api, textColor = textColor)
+                }
+                else -> Surface(
+                    color = bubbleColor,
+                    shape = shape,
+                    modifier = Modifier
+                        .padding(horizontal = 4.dp)
+                        .clip(shape),
+                ) {
+                    Text(
+                        text = message.content,
+                        color = textColor,
+                        style = MaterialTheme.typography.bodyLarge,
+                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun PhotoMessage(message: Message, api: Api) {
+    val context = LocalContext.current
+    val url = api.mediaUrlFor(message) ?: return
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .widthIn(max = 260.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .clickable {
+                runCatching {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    context.startActivity(intent)
+                }
+            },
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(context).data(url).build(),
+            contentDescription = "Фото",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .widthIn(max = 260.dp)
+                .height(260.dp)
+                .background(IncomingBubbleDark),
+        )
+    }
+}
+
+@Composable
+private fun VideoThumbMessage(message: Message, api: Api, bubbleColor: Color) {
+    val context = LocalContext.current
+    val url = api.mediaUrlFor(message) ?: return
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp)
+            .widthIn(max = 260.dp)
+            .clip(RoundedCornerShape(18.dp))
+            .background(bubbleColor)
+            .clickable {
+                runCatching {
+                    val intent = Intent(Intent.ACTION_VIEW, Uri.parse(url))
+                    intent.setDataAndType(Uri.parse(url), message.mediaMime ?: "video/mp4")
+                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    context.startActivity(intent)
+                }
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        AsyncImage(
+            model = ImageRequest.Builder(context)
+                .data(url)
+                .decoderFactory(VideoFrameDecoder.Factory())
+                .crossfade(true)
+                .build(),
+            contentDescription = "Видео",
+            contentScale = ContentScale.Crop,
+            modifier = Modifier
+                .widthIn(max = 260.dp)
+                .height(220.dp)
+                .background(IncomingBubbleDark),
+        )
+        Icon(
+            imageVector = Icons.Rounded.PlayCircle,
+            contentDescription = "Воспроизвести",
+            tint = Color.White,
+            modifier = Modifier.size(56.dp),
+        )
+        if (message.mediaDurationMs != null) {
+            Box(
                 modifier = Modifier
-                    .padding(horizontal = 4.dp)
-                    .clip(shape),
+                    .align(Alignment.BottomEnd)
+                    .padding(8.dp)
+                    .clip(RoundedCornerShape(6.dp))
+                    .background(Color(0xCC000000))
+                    .padding(horizontal = 6.dp, vertical = 2.dp),
             ) {
                 Text(
-                    text = message.content,
-                    color = textColor,
-                    style = MaterialTheme.typography.bodyLarge,
-                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                    text = MediaUtils.formatDuration(message.mediaDurationMs),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(androidx.media3.common.util.UnstableApi::class)
+@Composable
+private fun VideoCircleMessage(message: Message, api: Api) {
+    val context = LocalContext.current
+    val url = api.mediaUrlFor(message) ?: return
+    val player = remember(url) {
+        ExoPlayer.Builder(context).build().apply {
+            setMediaItem(MediaItem.fromUri(url))
+            repeatMode = Player.REPEAT_MODE_ONE
+            volume = 1f
+            playWhenReady = false
+            prepare()
+        }
+    }
+    DisposableEffect(player) {
+        onDispose { player.release() }
+    }
+    var playing by remember { mutableStateOf(false) }
+    Box(
+        modifier = Modifier
+            .padding(horizontal = 4.dp, vertical = 2.dp)
+            .size(220.dp)
+            .clip(CircleShape)
+            .background(Color.Black)
+            .clickable {
+                playing = !playing
+                player.playWhenReady = playing
+                if (playing) player.seekTo(0L)
+            },
+        contentAlignment = Alignment.Center,
+    ) {
+        androidx.compose.ui.viewinterop.AndroidView(
+            factory = { ctx ->
+                PlayerView(ctx).apply {
+                    useController = false
+                    setShutterBackgroundColor(android.graphics.Color.BLACK)
+                    this.player = player
+                }
+            },
+            modifier = Modifier.size(220.dp).clip(CircleShape),
+        )
+        if (!playing) {
+            Icon(
+                imageVector = Icons.Rounded.PlayCircle,
+                contentDescription = "Воспроизвести",
+                tint = Color.White,
+                modifier = Modifier.size(56.dp),
+            )
+        }
+        if (message.mediaDurationMs != null) {
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    .padding(bottom = 10.dp)
+                    .clip(RoundedCornerShape(8.dp))
+                    .background(Color(0x99000000))
+                    .padding(horizontal = 8.dp, vertical = 2.dp),
+            ) {
+                Text(
+                    text = MediaUtils.formatDuration(message.mediaDurationMs),
+                    color = Color.White,
+                    style = MaterialTheme.typography.labelSmall,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun VoiceMessageContent(message: Message, api: Api, textColor: Color) {
+    val context = LocalContext.current
+    val url = api.mediaUrlFor(message) ?: return
+    var playing by remember(url) { mutableStateOf(false) }
+    var prepared by remember(url) { mutableStateOf(false) }
+    val player = remember(url) {
+        MediaPlayer().apply {
+            setOnCompletionListener { playing = false; seekTo(0) }
+            setOnPreparedListener { prepared = true }
+            setOnErrorListener { _, _, _ -> playing = false; true }
+        }
+    }
+    DisposableEffect(player) {
+        runCatching {
+            player.setDataSource(url)
+            player.prepareAsync()
+        }
+        onDispose {
+            runCatching { player.release() }
+        }
+    }
+    Row(
+        modifier = Modifier.padding(horizontal = 10.dp, vertical = 8.dp).widthIn(min = 180.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier.size(36.dp).clip(CircleShape).background(Color(0x33FFFFFF)),
+            contentAlignment = Alignment.Center,
+        ) {
+            IconButton(
+                onClick = {
+                    if (!prepared) return@IconButton
+                    if (playing) {
+                        runCatching { player.pause() }
+                        playing = false
+                    } else {
+                        runCatching {
+                            player.start()
+                            playing = true
+                        }
+                    }
+                },
+            ) {
+                Icon(
+                    imageVector = if (playing) Icons.Rounded.Pause else Icons.Rounded.PlayArrow,
+                    contentDescription = if (playing) "Пауза" else "Воспроизвести",
+                    tint = textColor,
+                )
+            }
+        }
+        Spacer(Modifier.width(10.dp))
+        Column {
+            Text(
+                text = "Голосовое сообщение",
+                color = textColor,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Medium,
+            )
+            Text(
+                text = MediaUtils.formatDuration(message.mediaDurationMs),
+                color = textColor.copy(alpha = 0.75f),
+                style = MaterialTheme.typography.labelSmall,
+            )
+        }
+    }
+}
+
+@Composable
+private fun FileMessageContent(message: Message, api: Api, textColor: Color) {
+    val context = LocalContext.current
+    val url = api.mediaUrlFor(message) ?: return
+    Row(
+        modifier = Modifier
+            .padding(horizontal = 10.dp, vertical = 10.dp)
+            .widthIn(min = 200.dp, max = 280.dp)
+            .clickable {
+                runCatching {
+                    val intent = Intent(Intent.ACTION_VIEW)
+                    intent.setDataAndType(Uri.parse(url), message.mediaMime ?: "*/*")
+                    intent.flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                    context.startActivity(intent)
+                }
+            },
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier.size(40.dp).clip(CircleShape).background(Color(0x33FFFFFF)),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.InsertDriveFile,
+                contentDescription = "Файл",
+                tint = textColor,
+            )
+        }
+        Spacer(Modifier.width(10.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = message.mediaFilename ?: "Файл",
+                color = textColor,
+                style = MaterialTheme.typography.bodyMedium,
+                fontWeight = FontWeight.Medium,
+                maxLines = 1,
+            )
+            val sub = listOfNotNull(
+                MediaUtils.formatSize(message.mediaSize).takeIf { it.isNotBlank() },
+                message.mediaMime,
+            ).joinToString(" · ")
+            if (sub.isNotBlank()) {
+                Text(
+                    text = sub,
+                    color = textColor.copy(alpha = 0.75f),
+                    style = MaterialTheme.typography.labelSmall,
+                    maxLines = 1,
                 )
             }
         }
@@ -251,7 +770,12 @@ private fun MessageInput(
     onValueChange: (String) -> Unit,
     sending: Boolean,
     onSend: () -> Unit,
+    onAttach: () -> Unit,
+    onVoicePressAndHold: () -> Unit,
 ) {
+    val canSend by remember(value, sending) {
+        derivedStateOf { value.trim().isNotEmpty() && !sending }
+    }
     Surface(
         color = MaterialTheme.colorScheme.background,
         modifier = Modifier
@@ -260,9 +784,16 @@ private fun MessageInput(
             .navigationBarsPadding(),
     ) {
         Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 8.dp),
             verticalAlignment = Alignment.Bottom,
         ) {
+            IconButton(onClick = onAttach) {
+                Icon(
+                    imageVector = Icons.Rounded.AttachFile,
+                    contentDescription = "Прикрепить",
+                    tint = MaterialTheme.colorScheme.onBackground,
+                )
+            }
             OutlinedTextField(
                 value = value,
                 onValueChange = onValueChange,
@@ -273,22 +804,142 @@ private fun MessageInput(
                 keyboardOptions = KeyboardOptions(capitalization = KeyboardCapitalization.Sentences),
                 colors = OutlinedTextFieldDefaults.colors(),
             )
-            Spacer(Modifier.width(8.dp))
+            Spacer(Modifier.width(6.dp))
             Box(
                 modifier = Modifier
-                    .size(52.dp)
+                    .size(48.dp)
                     .clip(CircleShape)
-                    .background(BrandPrimary),
+                    .background(BrandPrimary)
+                    .pointerInput(canSend) {
+                        detectTapGestures(
+                            onLongPress = {
+                                if (!canSend) onVoicePressAndHold()
+                            },
+                            onTap = {
+                                if (canSend) onSend() else onVoicePressAndHold()
+                            },
+                        )
+                    },
                 contentAlignment = Alignment.Center,
             ) {
-                IconButton(onClick = onSend, enabled = !sending) {
-                    Icon(
-                        imageVector = Icons.Rounded.Send,
-                        contentDescription = "Отправить",
-                        tint = Color.White,
-                    )
-                }
+                Icon(
+                    imageVector = if (canSend) Icons.Rounded.Send else Icons.Rounded.Mic,
+                    contentDescription = if (canSend) "Отправить" else "Голосовое",
+                    tint = Color.White,
+                )
             }
         }
+    }
+}
+
+@Composable
+private fun RecordingIndicator(
+    elapsedMs: Long,
+    onCancel: () -> Unit,
+    onStop: () -> Unit,
+) {
+    Surface(
+        color = MaterialTheme.colorScheme.background,
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .navigationBarsPadding(),
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 8.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onCancel) {
+                Icon(Icons.Rounded.Close, contentDescription = "Отменить")
+            }
+            Box(
+                modifier = Modifier
+                    .size(14.dp)
+                    .clip(CircleShape)
+                    .background(Color(0xFFB00020)),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "Запись… ${MediaUtils.formatDuration(elapsedMs.toInt())}",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground,
+                modifier = Modifier.weight(1f),
+            )
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(CircleShape)
+                    .background(BrandPrimary)
+                    .clickable(onClick = onStop),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.Send,
+                    contentDescription = "Отправить",
+                    tint = Color.White,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AttachMenuDialog(
+    onDismiss: () -> Unit,
+    onPickPhoto: () -> Unit,
+    onPickVideo: () -> Unit,
+    onPickFile: () -> Unit,
+    onVideoCircle: () -> Unit,
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        confirmButton = {
+            TextButton(onClick = onDismiss) { Text("Отмена") }
+        },
+        title = { Text("Прикрепить") },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                AttachRow(
+                    icon = Icons.Rounded.InsertDriveFile,
+                    label = "Фото из галереи",
+                    onClick = onPickPhoto,
+                )
+                AttachRow(
+                    icon = Icons.Rounded.PlayCircle,
+                    label = "Видео из галереи",
+                    onClick = onPickVideo,
+                )
+                AttachRow(
+                    icon = Icons.Rounded.AttachFile,
+                    label = "Файл",
+                    onClick = onPickFile,
+                )
+                AttachRow(
+                    icon = Icons.Rounded.RadioButtonChecked,
+                    label = "Видеокружок",
+                    onClick = onVideoCircle,
+                )
+            }
+        },
+    )
+}
+
+@Composable
+private fun AttachRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    label: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Icon(imageVector = icon, contentDescription = null)
+        Spacer(Modifier.width(12.dp))
+        Text(text = label, style = MaterialTheme.typography.bodyLarge)
     }
 }

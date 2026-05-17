@@ -1,0 +1,31 @@
+name: keep-alive
+
+on:
+  schedule:
+    # Every 5 minutes — Render free instances spin down after 15 min idle,
+    # so pinging at 5-min intervals keeps a margin even when GH Actions cron
+    # is delayed under high load.
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ping Render /healthz
+        run: |
+          set -e
+          URL="https://messenger-backend-7klo.onrender.com/healthz"
+          # Up to 3 attempts with a long timeout — Render cold start can take ~30s.
+          for i in 1 2 3; do
+            if curl --fail --silent --show-error --max-time 60 "$URL"; then
+              echo ""
+              echo "ping ok on attempt $i"
+              exit 0
+            fi
+            echo "attempt $i failed, retrying..."
+            sleep 10
+          done
+          echo "all attempts failed"
+          exit 1

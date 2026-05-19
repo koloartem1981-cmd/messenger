@@ -15,15 +15,18 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.statusBarsPadding
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Campaign
+import androidx.compose.material.icons.rounded.Group
 import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.PersonAdd
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FloatingActionButton
 import androidx.compose.material3.Icon
@@ -32,6 +35,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.runtime.Composable
@@ -49,7 +53,10 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.devin.messenger.data.Api
-import com.devin.messenger.data.ChatPreview
+import com.devin.messenger.data.Chat
+import com.devin.messenger.data.ChatEntry
+import com.devin.messenger.data.Message
+import com.devin.messenger.data.MessageKind
 import com.devin.messenger.data.RealtimeBus
 import com.devin.messenger.data.UserPublic
 import com.devin.messenger.ui.components.Avatar
@@ -62,18 +69,21 @@ fun HomeScreen(
     api: Api,
     token: String?,
     currentUser: UserPublic?,
-    onOpenChat: (UserPublic) -> Unit,
+    onOpenDm: (UserPublic) -> Unit,
+    onOpenGroup: (Chat) -> Unit,
     onOpenSearch: () -> Unit,
     onOpenProfile: () -> Unit,
+    onCreateChat: (type: String) -> Unit,
 ) {
-    var chats by remember { mutableStateOf<List<ChatPreview>>(emptyList()) }
+    var entries by remember { mutableStateOf<List<ChatEntry>>(emptyList()) }
     var loading by remember { mutableStateOf(true) }
+    var newChatMenuOpen by remember { mutableStateOf(false) }
 
     suspend fun reload() {
         if (token == null) return
         loading = true
         try {
-            chats = api.listChats(token)
+            entries = api.listChats(token)
         } catch (_: Exception) {
         } finally {
             loading = false
@@ -113,6 +123,9 @@ fun HomeScreen(
                     }
                 },
                 actions = {
+                    IconButton(onClick = onOpenSearch) {
+                        Icon(Icons.Rounded.Search, contentDescription = "Поиск")
+                    }
                     IconButton(onClick = onOpenProfile) {
                         if (currentUser != null) {
                             Avatar(
@@ -132,7 +145,7 @@ fun HomeScreen(
         },
         floatingActionButton = {
             FloatingActionButton(
-                onClick = onOpenSearch,
+                onClick = { newChatMenuOpen = true },
                 shape = CircleShape,
                 containerColor = BrandPrimary,
                 contentColor = Color.White,
@@ -142,29 +155,81 @@ fun HomeScreen(
         },
     ) { paddingValues ->
         Box(modifier = Modifier.fillMaxSize().padding(paddingValues)) {
-            if (chats.isEmpty() && !loading) {
-                EmptyState(onOpenSearch = onOpenSearch)
+            if (entries.isEmpty() && !loading) {
+                EmptyState()
             } else {
                 LazyColumn(
                     modifier = Modifier.fillMaxSize().animateContentSize(tween(300)),
                     contentPadding = PaddingValues(vertical = 8.dp),
                 ) {
-                    items(items = chats, key = { it.peer.id }) { chat ->
-                        ChatListItem(
-                            chat = chat,
+                    items(items = entries, key = { entryKey(it) }) { entry ->
+                        ChatEntryRow(
+                            entry = entry,
                             api = api,
-                            onClick = { onOpenChat(chat.peer) },
+                            onClick = {
+                                when {
+                                    entry.peer != null -> onOpenDm(entry.peer)
+                                    entry.chat != null -> onOpenGroup(entry.chat)
+                                }
+                            },
                         )
                     }
                 }
             }
         }
     }
+
+    if (newChatMenuOpen) {
+        AlertDialog(
+            onDismissRequest = { newChatMenuOpen = false },
+            confirmButton = {
+                TextButton(onClick = { newChatMenuOpen = false }) { Text("Отмена") }
+            },
+            title = { Text("Создать") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    NewChatRow(
+                        icon = Icons.Rounded.PersonAdd,
+                        title = "Поиск людей",
+                        subtitle = "Открыть личный чат",
+                        onClick = {
+                            newChatMenuOpen = false
+                            onOpenSearch()
+                        },
+                    )
+                    NewChatRow(
+                        icon = Icons.Rounded.Group,
+                        title = "Группа",
+                        subtitle = "Несколько участников, все могут писать",
+                        onClick = {
+                            newChatMenuOpen = false
+                            onCreateChat("group")
+                        },
+                    )
+                    NewChatRow(
+                        icon = Icons.Rounded.Campaign,
+                        title = "Канал",
+                        subtitle = "Пишет только создатель / админ",
+                        onClick = {
+                            newChatMenuOpen = false
+                            onCreateChat("channel")
+                        },
+                    )
+                }
+            },
+        )
+    }
+}
+
+private fun entryKey(entry: ChatEntry): String = when {
+    entry.peer != null -> "dm-${entry.peer.id}"
+    entry.chat != null -> "chat-${entry.chat.id}"
+    else -> "unknown"
 }
 
 @Composable
-private fun ChatListItem(
-    chat: ChatPreview,
+private fun ChatEntryRow(
+    entry: ChatEntry,
     api: Api,
     onClick: () -> Unit,
 ) {
@@ -179,22 +244,38 @@ private fun ChatListItem(
                 .padding(horizontal = 16.dp, vertical = 12.dp),
             verticalAlignment = Alignment.CenterVertically,
         ) {
-            Avatar(
-                user = chat.peer,
-                fullUrl = api.avatarUrlFor(chat.peer),
-                size = 52.dp,
-            )
-            Spacer(Modifier.width(14.dp))
-            Column(modifier = Modifier.weight(1f)) {
-                Text(
-                    text = chat.peer.displayName,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = MaterialTheme.colorScheme.onBackground,
-                    fontWeight = FontWeight.SemiBold,
+            if (entry.peer != null) {
+                Avatar(
+                    user = entry.peer,
+                    fullUrl = api.avatarUrlFor(entry.peer),
+                    size = 52.dp,
                 )
+            } else if (entry.chat != null) {
+                GroupAvatar(chat = entry.chat, api = api)
+            }
+            Spacer(Modifier.size(14.dp, 0.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    if (entry.chat != null) {
+                        Icon(
+                            imageVector = if (entry.chat.isChannel) Icons.Rounded.Campaign else Icons.Rounded.Group,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.55f),
+                            modifier = Modifier.size(16.dp),
+                        )
+                        Spacer(Modifier.size(6.dp, 0.dp))
+                    }
+                    Text(
+                        text = entry.title.ifBlank { "Чат" },
+                        style = MaterialTheme.typography.titleMedium,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                    )
+                }
                 Spacer(Modifier.height(2.dp))
                 Text(
-                    text = chat.lastMessage?.content ?: "@${chat.peer.username} — нет сообщений",
+                    text = previewLine(entry),
                     style = MaterialTheme.typography.bodyMedium,
                     color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
                     maxLines = 1,
@@ -205,7 +286,91 @@ private fun ChatListItem(
 }
 
 @Composable
-private fun EmptyState(@Suppress("UNUSED_PARAMETER") onOpenSearch: () -> Unit) {
+private fun GroupAvatar(chat: Chat, api: Api) {
+    val url = api.chatAvatarUrlFor(chat)
+    Box(
+        modifier = Modifier
+            .size(52.dp)
+            .clip(CircleShape)
+            .background(Brush.linearGradient(listOf(BrandPrimary, BrandAccent))),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (url != null) {
+            coil.compose.AsyncImage(
+                model = url,
+                contentDescription = chat.title,
+                modifier = Modifier.size(52.dp).clip(CircleShape),
+            )
+        } else {
+            Icon(
+                imageVector = if (chat.isChannel) Icons.Rounded.Campaign else Icons.Rounded.Group,
+                contentDescription = null,
+                tint = Color.White,
+                modifier = Modifier.size(26.dp),
+            )
+        }
+    }
+}
+
+private fun previewLine(entry: ChatEntry): String {
+    val last = entry.lastMessage
+    if (last != null) return previewForMessage(last)
+    return when {
+        entry.peer != null -> "@${entry.peer.username} — нет сообщений"
+        entry.chat?.isChannel == true -> "${entry.chat.membersCount ?: 0} подписчиков"
+        entry.chat != null -> "${entry.chat.membersCount ?: 0} участников"
+        else -> ""
+    }
+}
+
+private fun previewForMessage(m: Message): String = when (m.kind) {
+    MessageKind.TEXT -> m.content.ifBlank { "(сообщение)" }
+    MessageKind.VOICE -> "Голосовое сообщение"
+    MessageKind.PHOTO -> "Фото"
+    MessageKind.VIDEO -> "Видео"
+    MessageKind.VIDEO_CIRCLE -> "Видеокружок"
+    MessageKind.FILE -> m.mediaFilename?.let { "Файл: $it" } ?: "Файл"
+    else -> m.content.ifBlank { "(сообщение)" }
+}
+
+@Composable
+private fun NewChatRow(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    title: String,
+    subtitle: String,
+    onClick: () -> Unit,
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 8.dp, vertical = 12.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(CircleShape)
+                .background(Brush.linearGradient(listOf(BrandPrimary, BrandAccent))),
+            contentAlignment = Alignment.Center,
+        ) {
+            Icon(icon, contentDescription = null, tint = Color.White)
+        }
+        Spacer(Modifier.size(12.dp, 0.dp))
+        Column {
+            Text(text = title, style = MaterialTheme.typography.bodyLarge, fontWeight = FontWeight.SemiBold)
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.65f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun EmptyState() {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -230,7 +395,7 @@ private fun EmptyState(@Suppress("UNUSED_PARAMETER") onOpenSearch: () -> Unit) {
         )
         Spacer(Modifier.height(8.dp))
         Text(
-            text = "Найди друзей по юзернейму и начни общение",
+            text = "Создай группу или канал, либо открой личный чат через поиск",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
         )

@@ -19,6 +19,8 @@ import com.devin.messenger.data.SessionStore
 import com.devin.messenger.data.UserPublic
 import com.devin.messenger.ui.auth.AuthScreen
 import com.devin.messenger.ui.chat.ChatScreen
+import com.devin.messenger.ui.chatsettings.ChatSettingsScreen
+import com.devin.messenger.ui.createchat.CreateChatScreen
 import com.devin.messenger.ui.home.HomeScreen
 import com.devin.messenger.ui.profile.ProfileScreen
 import com.devin.messenger.ui.search.SearchScreen
@@ -28,12 +30,21 @@ object Routes {
     const val HOME = "home"
     const val SEARCH = "search"
     const val PROFILE = "profile"
-    const val CHAT = "chat/{peerId}/{peerName}/{peerUsername}/{peerAvatar}"
+    const val DM = "dm/{peerId}/{peerName}/{peerUsername}/{peerAvatar}"
+    const val GROUP_CHAT = "chat/{chatId}"
+    const val CREATE_CHAT = "create_chat/{type}"
+    const val CHAT_SETTINGS = "chat_settings/{chatId}"
 
-    fun chat(peerId: Long, peerName: String, peerUsername: String, peerAvatar: String?): String {
+    fun dm(peerId: Long, peerName: String, peerUsername: String, peerAvatar: String?): String {
         val avatar = peerAvatar ?: ""
-        return "chat/$peerId/${encode(peerName)}/${encode(peerUsername)}/${encode(avatar)}"
+        return "dm/$peerId/${encode(peerName)}/${encode(peerUsername)}/${encode(avatar)}"
     }
+
+    fun groupChat(chatId: Long): String = "chat/$chatId"
+
+    fun createChat(type: String): String = "create_chat/$type"
+
+    fun chatSettings(chatId: Long): String = "chat_settings/$chatId"
 
     private fun encode(value: String): String =
         android.net.Uri.encode(value.ifEmpty { "_" })
@@ -96,9 +107,9 @@ fun AppNav(
                 api = api,
                 token = token,
                 currentUser = currentUser,
-                onOpenChat = { peer ->
+                onOpenDm = { peer ->
                     navController.navigate(
-                        Routes.chat(
+                        Routes.dm(
                             peerId = peer.id,
                             peerName = peer.displayName,
                             peerUsername = peer.username,
@@ -106,8 +117,14 @@ fun AppNav(
                         )
                     )
                 },
+                onOpenGroup = { chat ->
+                    navController.navigate(Routes.groupChat(chat.id))
+                },
                 onOpenSearch = { navController.navigate(Routes.SEARCH) },
                 onOpenProfile = { navController.navigate(Routes.PROFILE) },
+                onCreateChat = { type ->
+                    navController.navigate(Routes.createChat(type))
+                },
             )
         }
         composable(Routes.SEARCH) {
@@ -116,7 +133,7 @@ fun AppNav(
                 token = token,
                 onOpenChat = { peer ->
                     navController.navigate(
-                        Routes.chat(
+                        Routes.dm(
                             peerId = peer.id,
                             peerName = peer.displayName,
                             peerUsername = peer.username,
@@ -145,7 +162,7 @@ fun AppNav(
             )
         }
         composable(
-            route = Routes.CHAT,
+            route = Routes.DM,
             arguments = listOf(
                 navArgument("peerId") { type = NavType.LongType },
                 navArgument("peerName") { type = NavType.StringType },
@@ -161,11 +178,63 @@ fun AppNav(
                 api = api,
                 token = token,
                 currentUserId = currentUser?.id ?: 0L,
-                peerId = peerId,
-                peerDisplayName = peerName,
-                peerUsername = peerUsername,
-                peerAvatarUrl = peerAvatar.takeIf { it.isNotBlank() },
+                dmPeerId = peerId,
+                dmPeerDisplayName = peerName,
+                dmPeerUsername = peerUsername,
+                dmPeerAvatarUrl = peerAvatar.takeIf { it.isNotBlank() },
                 onBack = { navController.popBackStack() },
+            )
+        }
+        composable(
+            route = Routes.GROUP_CHAT,
+            arguments = listOf(
+                navArgument("chatId") { type = NavType.LongType },
+            ),
+        ) { backStack ->
+            val chatId = backStack.arguments?.getLong("chatId") ?: 0L
+            ChatScreen(
+                api = api,
+                token = token,
+                currentUserId = currentUser?.id ?: 0L,
+                chatId = chatId,
+                onBack = { navController.popBackStack() },
+                onOpenChatSettings = { id ->
+                    navController.navigate(Routes.chatSettings(id))
+                },
+            )
+        }
+        composable(
+            route = Routes.CREATE_CHAT,
+            arguments = listOf(navArgument("type") { type = NavType.StringType }),
+        ) { backStack ->
+            val type = backStack.arguments?.getString("type") ?: "group"
+            CreateChatScreen(
+                api = api,
+                token = token,
+                type = type,
+                currentUserId = currentUser?.id ?: 0L,
+                onCreated = { chat ->
+                    navController.navigate(Routes.groupChat(chat.id)) {
+                        popUpTo(Routes.HOME)
+                    }
+                },
+                onBack = { navController.popBackStack() },
+            )
+        }
+        composable(
+            route = Routes.CHAT_SETTINGS,
+            arguments = listOf(navArgument("chatId") { type = NavType.LongType }),
+        ) { backStack ->
+            val chatId = backStack.arguments?.getLong("chatId") ?: 0L
+            ChatSettingsScreen(
+                api = api,
+                token = token,
+                chatId = chatId,
+                currentUserId = currentUser?.id ?: 0L,
+                onClosed = { navController.popBackStack() },
+                onDeleted = {
+                    navController.popBackStack(Routes.HOME, inclusive = false)
+                },
             )
         }
     }

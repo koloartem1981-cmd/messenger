@@ -11,8 +11,8 @@ android {
         applicationId = "com.devin.messenger"
         minSdk = 24
         targetSdk = 34
-        versionCode = 2
-        versionName = "1.1"
+        versionCode = 3
+        versionName = "1.2"
 
         val defaultBackend = (project.findProperty("MESSENGER_BACKEND_URL") as String?)
             ?: "https://messenger-backend.example.com"

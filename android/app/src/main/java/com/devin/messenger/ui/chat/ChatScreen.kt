@@ -1,7 +1,6 @@
 package com.devin.messenger.ui.chat
 
 import android.Manifest
-import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.media.MediaPlayer
@@ -14,7 +13,6 @@ import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
 import androidx.compose.animation.slideInVertically
 import androidx.compose.foundation.background
-import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
@@ -23,7 +21,6 @@ import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
-import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -43,7 +40,9 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AttachFile
+import androidx.compose.material.icons.rounded.Campaign
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Group
 import androidx.compose.material.icons.rounded.InsertDriveFile
 import androidx.compose.material.icons.rounded.Mic
 import androidx.compose.material.icons.rounded.Pause
@@ -51,7 +50,7 @@ import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PlayCircle
 import androidx.compose.material.icons.rounded.RadioButtonChecked
 import androidx.compose.material.icons.rounded.Send
-import androidx.compose.material.icons.rounded.Videocam
+import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -73,10 +72,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.KeyboardCapitalization
 import androidx.compose.ui.text.style.TextAlign
@@ -91,11 +93,13 @@ import coil.request.ImageRequest
 import coil.decode.VideoFrameDecoder
 import com.devin.messenger.audio.VoiceRecorder
 import com.devin.messenger.data.Api
+import com.devin.messenger.data.ChatDetails
 import com.devin.messenger.data.Message
 import com.devin.messenger.data.MessageKind
 import com.devin.messenger.data.RealtimeBus
 import com.devin.messenger.data.UserPublic
 import com.devin.messenger.ui.components.Avatar
+import com.devin.messenger.ui.theme.BrandAccent
 import com.devin.messenger.ui.theme.BrandPrimary
 import com.devin.messenger.ui.theme.IncomingBubbleDark
 import com.devin.messenger.ui.theme.OutgoingBubble
@@ -107,33 +111,45 @@ import kotlinx.coroutines.launch
 
 private const val MIN_VOICE_DURATION_MS = 700
 
+/**
+ * Unified chat screen that handles both 1-on-1 DMs and group/channel chats.
+ *
+ * Exactly one of [dmPeerId] or [chatId] must be greater than zero. The screen
+ * routes messages and metadata loads to the matching backend endpoints.
+ */
 @androidx.camera.core.ExperimentalGetImage
 @Composable
 fun ChatScreen(
     api: Api,
     token: String?,
     currentUserId: Long,
-    peerId: Long,
-    peerDisplayName: String,
-    peerUsername: String,
-    peerAvatarUrl: String?,
+    dmPeerId: Long = 0L,
+    dmPeerDisplayName: String = "",
+    dmPeerUsername: String = "",
+    dmPeerAvatarUrl: String? = null,
+    chatId: Long = 0L,
     onBack: () -> Unit,
+    onOpenChatSettings: ((Long) -> Unit) = {},
 ) {
+    val isGroupOrChannel = chatId > 0L
     val context = LocalContext.current
+    val focusManager = LocalFocusManager.current
+    val keyboardController = LocalSoftwareKeyboardController.current
     var messages by remember { mutableStateOf<List<Message>>(emptyList()) }
     var inputText by remember { mutableStateOf("") }
     var sending by remember { mutableStateOf(false) }
     var attachMenuOpen by remember { mutableStateOf(false) }
     var showCircleRecorder by remember { mutableStateOf(false) }
     var pendingPermissionAction by remember { mutableStateOf<(() -> Unit)?>(null) }
+    var chatDetails by remember(chatId) { mutableStateOf<ChatDetails?>(null) }
     val listState = rememberLazyListState()
     val scope = rememberCoroutineScope()
 
-    val peerStub = remember(peerId) {
+    val peerStub = remember(dmPeerId, dmPeerUsername, dmPeerDisplayName) {
         UserPublic(
-            id = peerId,
-            username = peerUsername,
-            displayName = peerDisplayName,
+            id = dmPeerId,
+            username = dmPeerUsername,
+            displayName = dmPeerDisplayName,
             bio = null,
             avatarUrl = null,
         )
@@ -150,6 +166,11 @@ fun ChatScreen(
             recordingElapsed = System.currentTimeMillis() - recordingStartedAt
             delay(80)
         }
+    }
+
+    fun dismissKeyboard() {
+        focusManager.clearFocus(force = true)
+        keyboardController?.hide()
     }
 
     suspend fun appendIfNew(msg: Message) {
@@ -170,15 +191,27 @@ fun ChatScreen(
         val authToken = token ?: return
         scope.launch {
             try {
-                val sent = api.sendMediaMessage(
-                    token = authToken,
-                    recipientId = peerId,
-                    kind = kind,
-                    file = file,
-                    mime = mime,
-                    durationMs = durationMs,
-                    caption = caption,
-                )
+                val sent = if (isGroupOrChannel) {
+                    api.sendChatMediaMessage(
+                        token = authToken,
+                        chatId = chatId,
+                        kind = kind,
+                        file = file,
+                        mime = mime,
+                        durationMs = durationMs,
+                        caption = caption,
+                    )
+                } else {
+                    api.sendMediaMessage(
+                        token = authToken,
+                        recipientId = dmPeerId,
+                        kind = kind,
+                        file = file,
+                        mime = mime,
+                        durationMs = durationMs,
+                        caption = caption,
+                    )
+                }
                 appendIfNew(sent)
             } catch (_: Exception) {
                 // surfaces silently for now; toast could be added later
@@ -249,10 +282,21 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(token, peerId) {
+    fun openVideoCircleRecorder() {
+        // Drop IME focus so the camera UI opens onto a clean surface instead of
+        // racing with a keyboard that the text field would otherwise keep open.
+        dismissKeyboard()
+        ensureCameraPermission { showCircleRecorder = true }
+    }
+
+    LaunchedEffect(token, dmPeerId, chatId) {
         if (token == null) return@LaunchedEffect
         try {
-            messages = api.listMessages(token, peerId)
+            messages = if (isGroupOrChannel) {
+                api.listChatMessages(token, chatId)
+            } else {
+                api.listMessages(token, dmPeerId)
+            }
             if (messages.isNotEmpty()) {
                 listState.scrollToItem(messages.size - 1)
             }
@@ -260,17 +304,33 @@ fun ChatScreen(
         }
     }
 
-    LaunchedEffect(token, peerId) {
+    LaunchedEffect(token, chatId) {
+        if (token == null || !isGroupOrChannel) return@LaunchedEffect
+        try {
+            chatDetails = api.getChatDetails(token, chatId)
+        } catch (_: Exception) {
+        }
+    }
+
+    LaunchedEffect(token, dmPeerId, chatId) {
         if (token == null) return@LaunchedEffect
         RealtimeBus.incoming.collect { msg ->
-            val involvesPeer = (msg.senderId == peerId && msg.recipientId == currentUserId) ||
-                (msg.recipientId == peerId && msg.senderId == currentUserId)
-            if (involvesPeer && messages.none { it.id == msg.id }) {
+            val matches = if (isGroupOrChannel) {
+                msg.chatId == chatId
+            } else {
+                msg.chatId == null && (
+                    (msg.senderId == dmPeerId && msg.recipientId == currentUserId) ||
+                        (msg.recipientId == dmPeerId && msg.senderId == currentUserId)
+                    )
+            }
+            if (matches && messages.none { it.id == msg.id }) {
                 messages = messages + msg
                 listState.animateScrollToItem(messages.size - 1)
             }
         }
     }
+
+    val canPost = if (isGroupOrChannel) chatDetails?.canPost ?: true else true
 
     Box(
         modifier = Modifier
@@ -278,11 +338,19 @@ fun ChatScreen(
             .background(MaterialTheme.colorScheme.background),
     ) {
         Column(modifier = Modifier.fillMaxSize().statusBarsPadding()) {
-            ChatHeader(
-                peer = peerStub,
-                avatarUrl = peerAvatarUrl,
-                onBack = onBack,
-            )
+            if (isGroupOrChannel) {
+                GroupChatHeader(
+                    details = chatDetails,
+                    onBack = onBack,
+                    onOpenSettings = { onOpenChatSettings(chatId) },
+                )
+            } else {
+                DmChatHeader(
+                    peer = peerStub,
+                    avatarUrl = dmPeerAvatarUrl,
+                    onBack = onBack,
+                )
+            }
             LazyColumn(
                 modifier = Modifier
                     .weight(1f)
@@ -293,12 +361,20 @@ fun ChatScreen(
             ) {
                 if (messages.isEmpty()) {
                     item {
+                        val emptyText = when {
+                            isGroupOrChannel && chatDetails?.chat?.isChannel == true ->
+                                "Это канал «${chatDetails?.chat?.title}» — здесь пишет только создатель"
+                            isGroupOrChannel ->
+                                "Группа «${chatDetails?.chat?.title ?: ""}» пуста. Напиши первое сообщение!"
+                            else ->
+                                "Поздоровайся с @$dmPeerUsername"
+                        }
                         Text(
-                            text = "Поздоровайся с @$peerUsername",
+                            text = emptyText,
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
                             textAlign = TextAlign.Center,
-                            modifier = Modifier.fillMaxWidth().padding(top = 80.dp),
+                            modifier = Modifier.fillMaxWidth().padding(top = 80.dp, start = 24.dp, end = 24.dp),
                         )
                     }
                 }
@@ -307,6 +383,10 @@ fun ChatScreen(
                         message = msg,
                         isOutgoing = msg.senderId == currentUserId,
                         api = api,
+                        showSenderName = isGroupOrChannel && msg.senderId != currentUserId,
+                        senderName = chatDetails?.members
+                            ?.firstOrNull { it.user.id == msg.senderId }
+                            ?.user?.displayName,
                     )
                 }
             }
@@ -334,7 +414,7 @@ fun ChatScreen(
                         recordingElapsed = 0L
                     },
                 )
-            } else {
+            } else if (canPost) {
                 MessageInput(
                     value = inputText,
                     onValueChange = { inputText = it },
@@ -345,7 +425,11 @@ fun ChatScreen(
                         sending = true
                         scope.launch {
                             try {
-                                val sent = api.sendMessage(token, peerId, text)
+                                val sent = if (isGroupOrChannel) {
+                                    api.sendChatMessage(token, chatId, text)
+                                } else {
+                                    api.sendMessage(token, dmPeerId, text)
+                                }
                                 appendIfNew(sent)
                                 inputText = ""
                             } catch (_: Exception) {
@@ -354,8 +438,12 @@ fun ChatScreen(
                             }
                         }
                     },
-                    onAttach = { attachMenuOpen = true },
+                    onAttach = {
+                        dismissKeyboard()
+                        attachMenuOpen = true
+                    },
                     onVoicePressAndHold = {
+                        dismissKeyboard()
                         ensureAudioPermission {
                             runCatching {
                                 recorder.start()
@@ -366,6 +454,8 @@ fun ChatScreen(
                         }
                     },
                 )
+            } else {
+                ReadOnlyChannelBanner()
             }
         }
     }
@@ -387,7 +477,7 @@ fun ChatScreen(
             },
             onVideoCircle = {
                 attachMenuOpen = false
-                ensureCameraPermission { showCircleRecorder = true }
+                openVideoCircleRecorder()
             },
         )
     }
@@ -409,7 +499,7 @@ fun ChatScreen(
 }
 
 @Composable
-private fun ChatHeader(
+private fun DmChatHeader(
     peer: UserPublic,
     avatarUrl: String?,
     onBack: () -> Unit,
@@ -444,7 +534,102 @@ private fun ChatHeader(
 }
 
 @Composable
-private fun MessageBubble(message: Message, isOutgoing: Boolean, api: Api) {
+private fun GroupChatHeader(
+    details: ChatDetails?,
+    onBack: () -> Unit,
+    onOpenSettings: () -> Unit,
+) {
+    val isChannel = details?.chat?.isChannel == true
+    Surface(color = MaterialTheme.colorScheme.background, modifier = Modifier.fillMaxWidth()) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .clickable(onClick = onOpenSettings)
+                .padding(horizontal = 8.dp, vertical = 8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            IconButton(onClick = onBack) {
+                Icon(Icons.Rounded.ArrowBack, contentDescription = "Назад")
+            }
+            Box(
+                modifier = Modifier
+                    .size(40.dp)
+                    .clip(CircleShape)
+                    .background(
+                        Brush.linearGradient(listOf(BrandPrimary, BrandAccent)),
+                    ),
+                contentAlignment = Alignment.Center,
+            ) {
+                Icon(
+                    imageVector = if (isChannel) Icons.Rounded.Campaign else Icons.Rounded.Group,
+                    contentDescription = null,
+                    tint = Color.White,
+                    modifier = Modifier.size(22.dp),
+                )
+            }
+            Spacer(Modifier.width(12.dp))
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = details?.chat?.title ?: "Чат",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                val subtitle = when {
+                    details == null -> "загрузка…"
+                    isChannel -> "канал · ${details.chat.membersCount ?: details.members.size} подписчиков"
+                    else -> "группа · ${details.chat.membersCount ?: details.members.size} участников"
+                }
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+                )
+            }
+            IconButton(onClick = onOpenSettings) {
+                Icon(Icons.Rounded.Settings, contentDescription = "Настройки чата")
+            }
+        }
+    }
+}
+
+@Composable
+private fun ReadOnlyChannelBanner() {
+    Surface(
+        color = MaterialTheme.colorScheme.background,
+        modifier = Modifier
+            .fillMaxWidth()
+            .imePadding()
+            .navigationBarsPadding(),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.Center,
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Campaign,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.6f),
+            )
+            Spacer(Modifier.width(8.dp))
+            Text(
+                text = "В этом канале пишет только создатель",
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onBackground.copy(alpha = 0.7f),
+            )
+        }
+    }
+}
+
+@Composable
+private fun MessageBubble(
+    message: Message,
+    isOutgoing: Boolean,
+    api: Api,
+    showSenderName: Boolean,
+    senderName: String?,
+) {
     val arrangement = if (isOutgoing) Arrangement.End else Arrangement.Start
     val bubbleColor = if (isOutgoing) OutgoingBubble else IncomingBubbleDark
     val textColor = Color.White
@@ -459,29 +644,40 @@ private fun MessageBubble(message: Message, isOutgoing: Boolean, api: Api) {
         exit = fadeOut(tween(160)),
     ) {
         Row(modifier = Modifier.fillMaxWidth(), horizontalArrangement = arrangement) {
-            when (message.kind) {
-                MessageKind.PHOTO -> PhotoMessage(message = message, api = api)
-                MessageKind.VIDEO -> VideoThumbMessage(message = message, api = api, bubbleColor = bubbleColor)
-                MessageKind.VIDEO_CIRCLE -> VideoCircleMessage(message = message, api = api)
-                MessageKind.VOICE -> Surface(color = bubbleColor, shape = shape) {
-                    VoiceMessageContent(message = message, api = api, textColor = textColor)
-                }
-                MessageKind.FILE -> Surface(color = bubbleColor, shape = shape) {
-                    FileMessageContent(message = message, api = api, textColor = textColor)
-                }
-                else -> Surface(
-                    color = bubbleColor,
-                    shape = shape,
-                    modifier = Modifier
-                        .padding(horizontal = 4.dp)
-                        .clip(shape),
-                ) {
+            Column(horizontalAlignment = if (isOutgoing) Alignment.End else Alignment.Start) {
+                if (showSenderName && !senderName.isNullOrBlank()) {
                     Text(
-                        text = message.content,
-                        color = textColor,
-                        style = MaterialTheme.typography.bodyLarge,
-                        modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        text = senderName,
+                        style = MaterialTheme.typography.labelSmall,
+                        color = BrandAccent,
+                        fontWeight = FontWeight.SemiBold,
+                        modifier = Modifier.padding(start = 8.dp, end = 8.dp, bottom = 2.dp),
                     )
+                }
+                when (message.kind) {
+                    MessageKind.PHOTO -> PhotoMessage(message = message, api = api)
+                    MessageKind.VIDEO -> VideoThumbMessage(message = message, api = api, bubbleColor = bubbleColor)
+                    MessageKind.VIDEO_CIRCLE -> VideoCircleMessage(message = message, api = api)
+                    MessageKind.VOICE -> Surface(color = bubbleColor, shape = shape) {
+                        VoiceMessageContent(message = message, api = api, textColor = textColor)
+                    }
+                    MessageKind.FILE -> Surface(color = bubbleColor, shape = shape) {
+                        FileMessageContent(message = message, api = api, textColor = textColor)
+                    }
+                    else -> Surface(
+                        color = bubbleColor,
+                        shape = shape,
+                        modifier = Modifier
+                            .padding(horizontal = 4.dp)
+                            .clip(shape),
+                    ) {
+                        Text(
+                            text = message.content,
+                            color = textColor,
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.padding(horizontal = 14.dp, vertical = 10.dp),
+                        )
+                    }
                 }
             }
         }
@@ -645,7 +841,6 @@ private fun VideoCircleMessage(message: Message, api: Api) {
 
 @Composable
 private fun VoiceMessageContent(message: Message, api: Api, textColor: Color) {
-    val context = LocalContext.current
     val url = api.mediaUrlFor(message) ?: return
     var playing by remember(url) { mutableStateOf(false) }
     var prepared by remember(url) { mutableStateOf(false) }

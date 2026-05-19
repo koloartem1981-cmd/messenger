@@ -119,9 +119,6 @@ class Api(
     suspend fun uploadAvatar(token: String, uri: Uri): UserPublic = withContext(Dispatchers.IO) {
         val resolver = context.contentResolver
         val rawMime = resolver.getType(uri) ?: "image/jpeg"
-        // Backend only accepts image/jpeg, image/png, image/webp — normalize anything
-        // exotic the gallery may report (heic/heif, etc.) to image/jpeg so the server
-        // re-encodes via Pillow rather than rejecting the upload.
         val mime = when (rawMime.lowercase()) {
             "image/jpeg", "image/jpg", "image/png", "image/webp" -> rawMime
             else -> "image/jpeg"
@@ -151,6 +148,12 @@ class Api(
     }
 
     // ---------- Users / Contacts ----------
+
+    suspend fun listAllUsers(token: String): List<UserPublic> {
+        val req = buildRequest("/users", "GET", token, null)
+        val arr = executeJsonArray(req)
+        return (0 until arr.length()).map { UserPublic.fromJson(arr.getJSONObject(it)) }
+    }
 
     suspend fun searchUsers(token: String, q: String): List<UserPublic> {
         val url = "$baseUrl/users/search?q=${Uri.encode(q)}"
@@ -185,13 +188,15 @@ class Api(
         return UserPublic.fromJson(executeJson(req))
     }
 
-    // ---------- Chats ----------
+    // ---------- Unified chat list ----------
 
-    suspend fun listChats(token: String): List<ChatPreview> {
+    suspend fun listChats(token: String): List<ChatEntry> {
         val req = buildRequest("/chats", "GET", token, null)
         val arr = executeJsonArray(req)
-        return (0 until arr.length()).map { ChatPreview.fromJson(arr.getJSONObject(it)) }
+        return (0 until arr.length()).map { ChatEntry.fromJson(arr.getJSONObject(it)) }
     }
+
+    // ---------- DM messages ----------
 
     suspend fun listMessages(token: String, peerId: Long): List<Message> {
         val req = buildRequest("/messages/$peerId", "GET", token, null)
@@ -240,8 +245,124 @@ class Api(
         Message.fromJson(executeJson(req))
     }
 
+    // ---------- Group / Channel chats ----------
+
+    suspend fun createChat(
+        token: String,
+        type: String,
+        title: String,
+        description: String? = null,
+        memberIds: List<Long> = emptyList(),
+    ): Chat {
+        val payload = JSONObject().apply {
+            put("type", type)
+            put("title", title)
+            if (!description.isNullOrBlank()) put("description", description)
+            val arr = JSONArray()
+            memberIds.forEach { arr.put(it) }
+            put("member_ids", arr)
+        }
+        val req = buildRequest("/chats", "POST", token, jsonBody(payload))
+        return Chat.fromJson(executeJson(req))
+    }
+
+    suspend fun getChatDetails(token: String, chatId: Long): ChatDetails {
+        val req = buildRequest("/chats/$chatId", "GET", token, null)
+        return ChatDetails.fromJson(executeJson(req))
+    }
+
+    suspend fun updateChat(
+        token: String,
+        chatId: Long,
+        title: String? = null,
+        description: String? = null,
+    ): Chat {
+        val payload = JSONObject()
+        if (title != null) payload.put("title", title)
+        if (description != null) payload.put("description", description)
+        val req = buildRequest("/chats/$chatId", "PATCH", token, jsonBody(payload))
+        return Chat.fromJson(executeJson(req))
+    }
+
+    suspend fun deleteChat(token: String, chatId: Long) {
+        val req = buildRequest("/chats/$chatId", "DELETE", token, "".toRequestBody(jsonMedia))
+        executeRaw(req)
+    }
+
+    suspend fun addChatMember(
+        token: String,
+        chatId: Long,
+        userId: Long,
+        role: String = "member",
+    ): JSONObject {
+        val payload = JSONObject().apply {
+            put("user_id", userId)
+            put("role", role)
+        }
+        val req = buildRequest("/chats/$chatId/members", "POST", token, jsonBody(payload))
+        return executeJson(req)
+    }
+
+    suspend fun removeChatMember(token: String, chatId: Long, userId: Long) {
+        val req = buildRequest(
+            "/chats/$chatId/members/$userId",
+            "DELETE",
+            token,
+            "".toRequestBody(jsonMedia),
+        )
+        executeRaw(req)
+    }
+
+    suspend fun listChatMessages(token: String, chatId: Long): List<Message> {
+        val req = buildRequest("/chats/$chatId/messages", "GET", token, null)
+        val arr = executeJsonArray(req)
+        return (0 until arr.length()).map { Message.fromJson(arr.getJSONObject(it)) }
+    }
+
+    suspend fun sendChatMessage(token: String, chatId: Long, content: String): Message {
+        val payload = JSONObject().put("content", content)
+        val req = buildRequest("/chats/$chatId/messages", "POST", token, jsonBody(payload))
+        return Message.fromJson(executeJson(req))
+    }
+
+    suspend fun sendChatMediaMessage(
+        token: String,
+        chatId: Long,
+        kind: String,
+        file: File,
+        mime: String,
+        durationMs: Int? = null,
+        caption: String? = null,
+    ): Message = withContext(Dispatchers.IO) {
+        val builder = MultipartBody.Builder()
+            .setType(MultipartBody.FORM)
+            .addFormDataPart(
+                name = "file",
+                filename = file.name,
+                body = file.asRequestBody(mime.toMediaType()),
+            )
+            .addFormDataPart("kind", kind)
+        if (durationMs != null && durationMs > 0) {
+            builder.addFormDataPart("duration_ms", durationMs.toString())
+        }
+        if (!caption.isNullOrBlank()) {
+            builder.addFormDataPart("caption", caption)
+        }
+        val req = Request.Builder()
+            .url("$baseUrl/chats/$chatId/messages/media")
+            .post(builder.build())
+            .header("Authorization", "Bearer $token")
+            .build()
+        Message.fromJson(executeJson(req))
+    }
+
     fun avatarUrlFor(user: UserPublic): String? =
         user.avatarUrl?.let { path ->
+            if (path.startsWith("http")) path else "$baseUrl$path"
+        }
+
+    fun chatAvatarUrlFor(chat: Chat): String? =
+        chat.avatarUrl?.let { path ->
             if (path.startsWith("http")) path else "$baseUrl$path"
         }
 

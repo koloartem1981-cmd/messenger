@@ -776,19 +776,32 @@ private fun VideoThumbMessage(message: Message, api: Api, bubbleColor: Color) {
 private fun VideoCircleMessage(message: Message, api: Api) {
     val context = LocalContext.current
     val url = api.mediaUrlFor(message) ?: return
+    var playing by remember { mutableStateOf(false) }
     val player = remember(url) {
         ExoPlayer.Builder(context).build().apply {
             setMediaItem(MediaItem.fromUri(url))
-            repeatMode = Player.REPEAT_MODE_ONE
+            repeatMode = Player.REPEAT_MODE_OFF
             volume = 1f
             playWhenReady = false
             prepare()
         }
     }
     DisposableEffect(player) {
-        onDispose { player.release() }
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(state: Int) {
+                if (state == Player.STATE_ENDED) {
+                    player.playWhenReady = false
+                    player.seekTo(0L)
+                    playing = false
+                }
+            }
+        }
+        player.addListener(listener)
+        onDispose {
+            player.removeListener(listener)
+            player.release()
+        }
     }
-    var playing by remember { mutableStateOf(false) }
     Box(
         modifier = Modifier
             .padding(horizontal = 4.dp, vertical = 2.dp)
@@ -797,8 +810,8 @@ private fun VideoCircleMessage(message: Message, api: Api) {
             .background(Color.Black)
             .clickable {
                 playing = !playing
-                player.playWhenReady = playing
                 if (playing) player.seekTo(0L)
+                player.playWhenReady = playing
             },
         contentAlignment = Alignment.Center,
     ) {
@@ -807,6 +820,7 @@ private fun VideoCircleMessage(message: Message, api: Api) {
                 PlayerView(ctx).apply {
                     useController = false
                     setShutterBackgroundColor(android.graphics.Color.BLACK)
+                    resizeMode = androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
                     this.player = player
                 }
             },

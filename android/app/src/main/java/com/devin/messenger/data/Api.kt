@@ -59,6 +59,9 @@ class Api(
                 val detail = runCatching {
                     JSONObject(raw).optString("detail", raw)
                 }.getOrDefault(raw)
+                if (resp.code == 401) {
+                    AuthBus.signalUnauthorized()
+                }
                 throw ApiException(resp.code, detail.ifBlank { "Request failed" })
             }
             raw

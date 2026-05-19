@@ -14,6 +14,7 @@ import androidx.navigation.compose.composable
 import androidx.navigation.compose.rememberNavController
 import androidx.navigation.navArgument
 import com.devin.messenger.data.Api
+import com.devin.messenger.data.AuthBus
 import com.devin.messenger.data.RealtimeBus
 import com.devin.messenger.data.SessionStore
 import com.devin.messenger.data.UserPublic
@@ -66,6 +67,16 @@ fun AppNav(
             RealtimeBus.connect(api, token)
         } else {
             RealtimeBus.disconnect()
+        }
+    }
+
+    LaunchedEffect(Unit) {
+        AuthBus.unauthorized.collect {
+            sessionStore.clear()
+            RealtimeBus.disconnect()
+            navController.navigate(Routes.AUTH) {
+                popUpTo(0) { inclusive = true }
+            }
         }
     }
 
